@@ -31,11 +31,13 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 70
     steps:
-      - name: Post new sales every two minutes for an hour
+      - name: Post new sales and draw due giveaways every two minutes for an hour
         env:
           # Change this if the site moves. It is not a secret.
           SALES_URL: https://zorpians.xyz/api/discord/sales
           SALES_SECRET: ${{ secrets.SALES_SECRET }}
+          # Draws giveaways that have closed and posts their winners. Not a secret either.
+          GIVEAWAY_URL: https://zorpians.xyz/tools/api/giveaway/cron
           # 27 calls, two minutes apart, is a little under the hour the next run starts.
           ROUNDS: "27"
         run: |
@@ -62,6 +64,21 @@ jobs:
               200|409) ;;
               401) echo "The route refused the secret. Check that SALES_SECRET here matches the one on the site."; fatal=1; break ;;
               *) echo "The route answered ${code}. Trying again next round." ;;
+            esac
+
+            # Giveaways: draws whatever has closed and posts its winners in Discord.
+            # It never stops the sales loop, whatever it answers, and only counts
+            # are printed: this repository and its logs are public.
+            rm -f giveaways.json
+            gcode=$(curl -sS -m 70 -o giveaways.json -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer ${SALES_SECRET}" \
+              "${GIVEAWAY_URL}") || gcode="000"
+            printf '%s round %s: giveaways HTTP %s ' "$(date -u +%H:%M:%S)" "${i}" "${gcode}"
+            case "${gcode}" in
+              200) jq -c '{considered, drawn, waiting, announced, failed}' giveaways.json 2>/dev/null || echo ;;
+              401) echo; echo "The giveaway route refused the secret." ;;
+              *) echo; echo "The giveaway route answered ${gcode}. Trying again next round." ;;
             esac
 
             [ "${i}" -lt "${ROUNDS}" ] && sleep 120
