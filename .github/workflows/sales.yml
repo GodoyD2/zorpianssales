@@ -1,0 +1,80 @@
+name: Zorpians sales bot
+
+# Vercel's Hobby plan runs a cron once a day, which is not a sales feed. This
+# calls the route every five minutes instead. GitHub's schedule is best effort
+# and is regularly late by several minutes under load, which is fine: the route
+# keeps its own cursor, so a late call reads a wider window and a call that
+# never happens is caught up by the next one.
+
+on:
+  # Hourly, because GitHub treats a short schedule as "whenever there is room"
+  # and often skips it. The job below does the frequent part itself, calling the
+  # route every two minutes for the rest of the hour, and dispatches the next
+  # hour when it ends. The schedule is the backstop for that chain, not the
+  # thing the feed depends on.
+  schedule:
+    - cron: "7 * * * *"
+  workflow_dispatch:
+
+# Nothing in this workflow reads or writes the repository.
+permissions:
+  actions: write
+
+# Runs never overlap. The route refuses a second run anyway, with a 409, but
+# not starting one is cheaper than being refused.
+concurrency:
+  group: zorpians-sales
+  cancel-in-progress: false
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    steps:
+      - name: Post new sales every two minutes for an hour
+        env:
+          # Change this if the site moves. It is not a secret.
+          SALES_URL: https://zorpians.xyz/api/discord/sales
+          SALES_SECRET: ${{ secrets.SALES_SECRET }}
+          # 27 calls, two minutes apart, is a little under the hour the next run starts.
+          ROUNDS: "27"
+        run: |
+          set -u
+          if [ -z "${SALES_SECRET}" ]; then
+            echo "SALES_SECRET is not set on this repository. Add it under Settings, Secrets and variables, Actions."
+            exit 1
+          fi
+
+          fatal=0
+          for i in $(seq 1 "${ROUNDS}"); do
+            # The secret goes in a header, never in the url, so it stays out of logs.
+            code=$(curl -sS -m 90 -o body.json -w '%{http_code}' \
+              -X POST \
+              -H "Authorization: Bearer ${SALES_SECRET}" \
+              -H "content-type: application/json" \
+              "${SALES_URL}") || code="000"
+
+            printf '%s round %s: HTTP %s ' "$(date -u +%H:%M:%S)" "${i}" "${code}"
+            head -c 400 body.json 2>/dev/null || true
+            echo
+
+            case "${code}" in
+              200|409) ;;
+              401) echo "The route refused the secret. Check that SALES_SECRET here matches the one on the site."; fatal=1; break ;;
+              *) echo "The route answered ${code}. Trying again next round." ;;
+            esac
+
+            [ "${i}" -lt "${ROUNDS}" ] && sleep 120
+          done
+
+          exit "${fatal}"
+
+      - name: Start the next hour
+        # The schedule alone is unreliable, so each run asks for the next one.
+        # A duplicate is harmless: the concurrency group keeps one alive and the
+        # route refuses a second run with 409.
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run "${{ github.workflow }}" --repo "${{ github.repository }}" || true
